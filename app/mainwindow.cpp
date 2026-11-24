@@ -56,6 +56,7 @@
 
 #include <KWayland/Client/connection_thread.h>
 #include <KWayland/Client/plasmashell.h>
+#include <KWayland/Client/plasmavirtualdesktop.h>
 #include <KWayland/Client/registry.h>
 #include <KWayland/Client/surface.h>
 
@@ -163,9 +164,13 @@ void MainWindow::initWayland()
     Registry *registry = new Registry(this);
     registry->create(connection);
     QObject::connect(registry, &Registry::interfacesAnnounced, this, [registry, this] {
-        const auto interface = registry->interface(Registry::Interface::PlasmaShell);
-        if (interface.name != 0) {
-            m_plasmaShell = registry->createPlasmaShell(interface.name, interface.version, this);
+        const auto plasmaShellInterface = registry->interface(Registry::Interface::PlasmaShell);
+        if (plasmaShellInterface.name != 0) {
+            m_plasmaShell = registry->createPlasmaShell(plasmaShellInterface.name, plasmaShellInterface.version, this);
+        }
+        const auto virtualDesktopInterface = registry->interface(Registry::Interface::PlasmaVirtualDesktopManagement);
+        if (virtualDesktopInterface.name != 0) {
+            m_virtualDesktopManagement = registry->createPlasmaVirtualDesktopManagement(virtualDesktopInterface.name, virtualDesktopInterface.version, this);
         }
     });
 
@@ -187,6 +192,81 @@ void MainWindow::initWaylandSurface()
         m_plasmaShellSurface->setPosition(pos());
         m_plasmaShellSurface->setSkipTaskbar(true);
         m_plasmaShellSurface->setSkipSwitcher(true);
+        updateWaylandSurfaceRole();
+    }
+}
+
+void MainWindow::updateWaylandSurfaceRole()
+{
+    if (!m_plasmaShell) {
+        return;
+    }
+
+    const bool showOnAllDesktops = Settings::showOnAllDesktops();
+    const auto newRole = showOnAllDesktops ? KWayland::Client::PlasmaShellSurface::Role::Panel : KWayland::Client::PlasmaShellSurface::Role::Normal;
+
+    // If the surface exists but the role needs to change, recreate the surface
+    // because the Plasma Shell protocol only allows setting the role before the surface is mapped.
+    if (m_plasmaShellSurface && m_currentWaylandRole != newRole) {
+        delete m_plasmaShellSurface;
+        m_plasmaShellSurface = nullptr;
+    }
+
+    // Create surface if needed
+    if (!m_plasmaShellSurface) {
+        if (auto surface = KWayland::Client::Surface::fromWindow(windowHandle())) {
+            m_plasmaShellSurface = m_plasmaShell->createSurface(surface, this);
+            m_plasmaShellSurface->setPosition(pos());
+            m_plasmaShellSurface->setSkipTaskbar(true);
+            m_plasmaShellSurface->setSkipSwitcher(true);
+        }
+    }
+
+    if (m_plasmaShellSurface) {
+        m_plasmaShellSurface->setRole(newRole);
+        if (showOnAllDesktops) {
+            m_plasmaShellSurface->setPanelBehavior(KWayland::Client::PlasmaShellSurface::PanelBehavior::WindowsGoBelow);
+            m_plasmaShellSurface->setPanelTakesFocus(true);
+            // When switching to all-desktops mode, clear the owning desktop ID
+            m_owningVirtualDesktopId.clear();
+        } else {
+            // When switching to per-desktop mode while window is visible,
+            // capture the current desktop as the owning desktop
+            if (m_currentWaylandRole == KWayland::Client::PlasmaShellSurface::Role::Panel && isVisible()) {
+                captureOwningVirtualDesktop();
+            }
+        }
+        m_currentWaylandRole = newRole;
+    }
+}
+
+void MainWindow::captureOwningVirtualDesktop()
+{
+    if (!m_isWayland || !m_virtualDesktopManagement || !m_owningVirtualDesktopId.isEmpty()) {
+        return;
+    }
+
+    // Get the current screen name
+    const int screenIndex = getScreen();
+    if (screenIndex < 0 || screenIndex >= m_outputOrderWatcher->outputOrder().size()) {
+        return;
+    }
+    const QString screenName = m_outputOrderWatcher->outputOrder().at(screenIndex);
+
+    // Get the currently active virtual desktop for this screen
+    if (auto *desktop = m_virtualDesktopManagement->currentDesktopByOutputName(screenName)) {
+        m_owningVirtualDesktopId = desktop->id();
+    }
+}
+
+void MainWindow::activateOwningVirtualDesktop()
+{
+    if (!m_isWayland || !m_virtualDesktopManagement || m_owningVirtualDesktopId.isEmpty()) {
+        return;
+    }
+
+    if (auto *desktop = m_virtualDesktopManagement->getVirtualDesktop(m_owningVirtualDesktopId)) {
+        desktop->requestActivate();
     }
 }
 
@@ -1001,6 +1081,7 @@ void MainWindow::applyWindowProperties()
     if (m_isWayland && m_plasmaShellSurface) {
         m_plasmaShellSurface->setSkipTaskbar(true);
         m_plasmaShellSurface->setSkipSwitcher(true);
+        updateWaylandSurfaceRole();
     }
 
     winId(); // make sure windowHandle() is created
@@ -1262,6 +1343,23 @@ void MainWindow::_toggleWindowState()
 {
     bool visible = isVisible();
 
+    // Handle Wayland virtual desktop activation when "Show on all desktops" is disabled
+    if (m_isWayland && !Settings::showOnAllDesktops()) {
+        const QString currentDesktopId = getCurrentVirtualDesktopId();
+        if (!m_owningVirtualDesktopId.isEmpty() && currentDesktopId != m_owningVirtualDesktopId) {
+            // We're on a different desktop than Yakuake's owning desktop
+            // Activate the owning desktop first
+            activateOwningVirtualDesktop();
+            // Wait for the desktop switch to complete before toggling
+            // The actual toggle will happen in the next event loop iteration
+            QMetaObject::invokeMethod(this, [this, visible]() {
+                performToggle(visible);
+            }, Qt::QueuedConnection);
+            return;
+        }
+    }
+
+    // Handle X11 case when window is visible but not active and on another desktop
     if (visible && !isActiveWindow() && Settings::keepOpen()) {
         // Window is open but doesn't have focus; it's set to stay open
         // regardless of focus loss.
@@ -1302,6 +1400,11 @@ void MainWindow::_toggleWindowState()
         }
     }
 
+    performToggle(visible);
+}
+
+void MainWindow::performToggle(bool visible)
+{
 #if HAVE_X11
     if (!Settings::useWMAssist() && m_kwinAssistPropSet)
         kwinAssistPropCleanup();
@@ -1333,6 +1436,24 @@ void MainWindow::_toggleWindowState()
             sharedAfterOpenWindow();
         }
     }
+}
+
+QString MainWindow::getCurrentVirtualDesktopId()
+{
+    if (!m_isWayland || !m_virtualDesktopManagement) {
+        return QString();
+    }
+
+    const int screenIndex = getScreen();
+    if (screenIndex < 0 || screenIndex >= m_outputOrderWatcher->outputOrder().size()) {
+        return QString();
+    }
+    const QString screenName = m_outputOrderWatcher->outputOrder().at(screenIndex);
+
+    if (auto *desktop = m_virtualDesktopManagement->currentDesktopByOutputName(screenName)) {
+        return desktop->id();
+    }
+    return QString();
 }
 
 void MainWindow::slideWindow()
@@ -1499,6 +1620,10 @@ void MainWindow::sharedAfterOpenWindow()
     applyWindowProperties();
 
     initWaylandSurface();
+
+    if (m_isWayland && !Settings::showOnAllDesktops()) {
+        captureOwningVirtualDesktop();
+    }
 
     Q_EMIT windowOpened();
 }

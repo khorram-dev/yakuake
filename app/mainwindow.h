@@ -12,6 +12,8 @@
 
 #include <KMainWindow>
 
+#include <KWayland/Client/plasmashell.h>
+
 #include <QTimer>
 
 #include "outputorderwatcher.h"
@@ -33,6 +35,8 @@ namespace Client
 {
 class PlasmaShell;
 class PlasmaShellSurface;
+class PlasmaVirtualDesktopManagement;
+class PlasmaVirtualDesktop;
 }
 }
 
@@ -178,6 +182,12 @@ private:
     QRect m_availableScreenRect;
     void _toggleWindowState();
 
+    void performToggle(bool visible);
+    QString getCurrentVirtualDesktopId();
+
+    void captureOwningVirtualDesktop();
+    void activateOwningVirtualDesktop();
+
     void slideWindow();
 
     void updateUseTranslucency();
@@ -213,8 +223,12 @@ private:
 
     void initWayland();
     void initWaylandSurface();
+    void updateWaylandSurfaceRole();
     KWayland::Client::PlasmaShell *m_plasmaShell = nullptr;
     KWayland::Client::PlasmaShellSurface *m_plasmaShellSurface = nullptr;
+    KWayland::Client::PlasmaVirtualDesktopManagement *m_virtualDesktopManagement = nullptr;
+    QString m_owningVirtualDesktopId;
+    KWayland::Client::PlasmaShellSurface::Role m_currentWaylandRole = KWayland::Client::PlasmaShellSurface::Role::Normal;
 
     OutputOrderWatcher *m_outputOrderWatcher = nullptr;
 };
